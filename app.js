@@ -1,118 +1,132 @@
-// 引入核心依赖（无需额外安装，之前已安装）
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
 const path = require('path');
 
-// 创建Express服务实例
 const app = express();
 
-// 1. 超强跨域配置（兼容所有设备、所有请求头，避免跨域报错）
+// 超强跨域配置
 app.use(cors({
-    origin: '*', // 允许所有来源访问（自用/分享场景均适用）
-    methods: ['GET', 'POST', 'DELETE'], // 仅开放需要的请求方法，更安全
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Accept', 'X-Requested-With'],
-    maxAge: 86400 // 预检请求缓存1天，减少重复请求
+    maxAge: 86400
 }));
 
-// 2. 数据解析配置（兼容JSON/表单格式，避免数据解析失败）
-app.use(express.json({ limit: '2mb' })); // 支持大一点的请求体，兜底
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
-// 3. 数据库配置（自动创建文件夹，避免路径错误）
+// 数据库配置
 const dbDir = path.join(__dirname, 'database');
 const dbPath = path.join(dbDir, 'visitor.db');
-// 自动创建database文件夹（不存在则创建）
 if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true }); // recursive: true 支持多级文件夹创建
+    fs.mkdirSync(dbDir, { recursive: true });
 }
 
-// 4. 连接SQLite数据库（加固错误处理，避免数据库崩溃）
+// 连接数据库
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
         console.error('❌ 数据库连接失败：', err.message);
         return;
     }
-    console.log('✅ 数据库连接成功（真实IP版）');
+    console.log('✅ 数据库连接成功（完整后台版）');
 
-    // 创建访客记录表（字段加固，避免建表失败）
-    const createTableSql = `
+    // 创建访客表（新增备注字段）
+    const createVisitorTableSql = `
         CREATE TABLE IF NOT EXISTS visitors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL DEFAULT '未知公网IP',
-            visit_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            visit_time DATETIME NOT NULL,
+            remark TEXT DEFAULT ''
         )
     `;
-    db.run(createTableSql, (err) => {
-        if (err) {
-            console.error('❌ 访客表创建失败：', err.message);
-            return;
-        }
-        console.log('✅ 访客表创建/验证成功');
+
+    // 创建黑名单表
+    const createBlacklistTableSql = `
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT NOT NULL UNIQUE,
+            create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    `;
+
+    // 执行建表
+    db.run(createVisitorTableSql, (err) => {
+        if (err) console.error('❌ 访客表创建失败：', err.message);
+        else console.log('✅ 访客表创建/验证成功');
+    });
+
+    db.run(createBlacklistTableSql, (err) => {
+        if (err) console.error('❌ 黑名单表创建失败：', err.message);
+        else console.log('✅ 黑名单表创建/验证成功');
     });
 });
 
-// 5. 核心接口：记录访客（最真实的IP获取，兼容所有网络/代理场景）
+// ========== 核心接口：记录访客（过滤黑名单） ==========
 app.post('/api/record-visitor', (req, res) => {
-    // 多维度获取真实公网IP（优先级从高到低，兜底完善）
+    // 1. 获取真实IP
     let realIp = '';
-    // 场景1：代理服务器/CDN（如Render、Nginx）传递的真实IP
     if (req.headers['x-forwarded-for']) {
-        // x-forwarded-for 可能返回多个IP（格式：用户IP, 代理IP1, 代理IP2），取第一个
         realIp = req.headers['x-forwarded-for'].split(',').map(ip => ip.trim())[0];
-    }
-    // 场景2：部分服务器直接传递的真实IP
-    else if (req.headers['x-real-ip']) {
+    } else if (req.headers['x-real-ip']) {
         realIp = req.headers['x-real-ip'].trim();
-    }
-    // 场景3：直接连接（无代理）的IP
-    else if (req.connection && req.connection.remoteAddress) {
+    } else if (req.connection && req.connection.remoteAddress) {
         realIp = req.connection.remoteAddress.trim();
-    }
-    // 场景4：Socket层直接获取的IP
-    else if (req.socket && req.socket.remoteAddress) {
+    } else if (req.socket && req.socket.remoteAddress) {
         realIp = req.socket.remoteAddress.trim();
-    }
-    // 场景5：兜底（所有场景都失败时，赋值合理默认值）
-    else {
+    } else {
         realIp = '未知公网IP（兼容模式）';
     }
 
-    // 过滤本地IP/服务器IP（避免记录127.0.0.1、::1、内网IP）
+    // 2. 过滤本地IP
     const localIpReg = /^(127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|::1|localhost)/i;
     if (localIpReg.test(realIp)) {
         realIp = '服务器内网IP（非访客真实IP）';
     }
 
-    // 写入数据库（加固错误处理，避免接口崩溃）
-    const insertSql = `INSERT INTO visitors (ip) VALUES (?)`;
-    db.run(insertSql, [realIp], (err) => {
+    // 3. 检查黑名单
+    db.get(`SELECT * FROM blacklist WHERE ip = ?`, [realIp], (err, blacklistItem) => {
         if (err) {
-            console.error('❌ 写入访客记录失败：', err.message);
-            return res.status(200).json({
-                success: false,
-                msg: '访客记录失败'
-            });
+            console.error('❌ 检查黑名单失败：', err.message);
+            return res.status(200).json({ success: false, msg: '记录失败' });
         }
 
-        // 成功返回（强制200状态码，兼容所有设备解析）
-        return res.status(200).json({
-            success: true,
-            msg: '访客记录成功',
-            visitorIp: realIp // 可选：返回记录的IP，方便调试
+        // 若在黑名单，拒绝记录
+        if (blacklistItem) {
+            return res.status(200).json({ success: false, msg: '该IP已被限制访问' });
+        }
+
+        // 4. 时区转换（UTC+8 北京时间）
+        const offsetHours = 8;
+        const localTime = new Date();
+        localTime.setHours(localTime.getUTCHours() + offsetHours);
+        const formattedTime = localTime.toISOString().replace('T', ' ').slice(0, 19);
+
+        // 5. 写入数据库
+        const insertSql = `INSERT INTO visitors (ip, visit_time) VALUES (?, ?)`;
+        db.run(insertSql, [realIp, formattedTime], (err) => {
+            if (err) {
+                console.error('❌ 写入访客记录失败：', err.message);
+                return res.status(200).json({ success: false, msg: '访客记录失败' });
+            }
+
+            return res.status(200).json({
+                success: true,
+                msg: '访客记录成功',
+                visitorIp: realIp,
+                visitTime: formattedTime
+            });
         });
     });
 });
 
-// 6. 核心接口：获取访客统计数据（稳定兜底，避免数据解析报错）
+// ========== 核心接口：获取访客数据 ==========
 app.get('/api/get-visitor-data', (req, res) => {
-    // 第一步：获取总访客数
     const countSql = `SELECT COUNT(*) AS totalCount FROM visitors`;
     db.get(countSql, (err, countResult) => {
         if (err) {
             console.error('❌ 获取总访客数失败：', err.message);
-            // 兜底返回有效数据，避免前端报错
             return res.status(200).json({
                 success: true,
                 totalCount: 0,
@@ -121,12 +135,10 @@ app.get('/api/get-visitor-data', (req, res) => {
             });
         }
 
-        // 第二步：获取所有访客记录（按访问时间倒序）
         const listSql = `SELECT * FROM visitors ORDER BY visit_time DESC`;
         db.all(listSql, (err, listResult) => {
             if (err) {
                 console.error('❌ 获取访客列表失败：', err.message);
-                // 兜底返回有效数据
                 return res.status(200).json({
                     success: true,
                     totalCount: countResult.totalCount || 0,
@@ -135,12 +147,10 @@ app.get('/api/get-visitor-data', (req, res) => {
                 });
             }
 
-            // 处理返回数据（兜底防null，避免前端解析报错）
             const totalCount = countResult.totalCount || 0;
             const lastVisit = listResult.length > 0 ? listResult[0].visit_time : '暂无有效访客记录';
             const ipList = listResult || [];
 
-            // 成功返回
             return res.status(200).json({
                 success: true,
                 totalCount,
@@ -151,62 +161,144 @@ app.get('/api/get-visitor-data', (req, res) => {
     });
 });
 
-// 7. 核心接口：重置所有访客数据（加固操作，避免误删）
-app.delete('/api/reset-visitor', (req, res) => {
-    // 第一步：删除所有访客记录
-    const deleteSql = `DELETE FROM visitors`;
-    db.run(deleteSql, (err) => {
+// ========== 新增接口：单个删除访客记录 ==========
+app.delete('/api/delete-visitor/:id', (req, res) => {
+    const { id } = req.params;
+    const deleteSql = `DELETE FROM visitors WHERE id = ?`;
+
+    db.run(deleteSql, [id], (err) => {
         if (err) {
-            console.error('❌ 清空访客记录失败：', err.message);
-            return res.status(200).json({
-                success: false,
-                msg: '访客记录重置失败'
-            });
+            console.error('❌ 删除单条访客记录失败：', err.message);
+            return res.status(200).json({ success: false, msg: '删除失败' });
         }
 
-        // 第二步：优化数据库（重置自增ID，释放存储空间）
-        db.run(`VACUUM`, (err) => {
-            if (err) {
-                console.error('❌ 数据库优化失败：', err.message);
-            }
+        return res.status(200).json({ success: true, msg: '删除成功' });
+    });
+});
 
-            // 成功返回
-            return res.status(200).json({
-                success: true,
-                msg: '访客记录重置成功（数据库已优化）'
+// ========== 新增接口：批量删除访客记录 ==========
+app.delete('/api/batch-delete-visitor', (req, res) => {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+        return res.status(200).json({ success: false, msg: '请选择要删除的记录' });
+    }
+
+    const placeholders = ids.map(() => '?').join(',');
+    const batchDeleteSql = `DELETE FROM visitors WHERE id IN (${placeholders})`;
+
+    db.run(batchDeleteSql, ids, (err) => {
+        if (err) {
+            console.error('❌ 批量删除访客记录失败：', err.message);
+            return res.status(200).json({ success: false, msg: '批量删除失败' });
+        }
+
+        return res.status(200).json({ success: true, msg: '批量删除成功' });
+    });
+});
+
+// ========== 新增接口：编辑访客备注 ==========
+app.put('/api/edit-visitor/:id', (req, res) => {
+    const { id } = req.params;
+    const { remark } = req.body;
+
+    const updateSql = `UPDATE visitors SET remark = ? WHERE id = ?`;
+    db.run(updateSql, [remark || '', id], (err) => {
+        if (err) {
+            console.error('❌ 修改访客备注失败：', err.message);
+            return res.status(200).json({ success: false, msg: '备注修改失败' });
+        }
+
+        return res.status(200).json({ success: true, msg: '备注修改成功' });
+    });
+});
+
+// ========== 新增接口：获取黑名单 ==========
+app.get('/api/get-blacklist', (req, res) => {
+    const listSql = `SELECT ip FROM blacklist ORDER BY create_time DESC`;
+    db.all(listSql, (err, result) => {
+        if (err) {
+            console.error('❌ 获取黑名单失败：', err.message);
+            return res.status(200).json({ success: false, blacklist: [] });
+        }
+
+        const blacklist = result.map(item => item.ip);
+        return res.status(200).json({ success: true, blacklist });
+    });
+});
+
+// ========== 新增接口：保存黑名单 ==========
+app.post('/api/save-blacklist', (req, res) => {
+    const { blacklist } = req.body;
+    if (!blacklist || !Array.isArray(blacklist)) {
+        return res.status(200).json({ success: false, msg: '黑名单数据格式错误' });
+    }
+
+    // 先清空原有黑名单
+    db.run(`DELETE FROM blacklist`, (err) => {
+        if (err) {
+            console.error('❌ 清空黑名单失败：', err.message);
+            return res.status(200).json({ success: false, msg: '保存黑名单失败' });
+        }
+
+        // 批量插入新黑名单
+        if (blacklist.length === 0) {
+            return res.status(200).json({ success: true, msg: '黑名单保存成功' });
+        }
+
+        const insertSql = `INSERT OR IGNORE INTO blacklist (ip, create_time) VALUES (?, CURRENT_TIMESTAMP)`;
+        blacklist.forEach(ip => {
+            db.run(insertSql, [ip.trim()], (err) => {
+                if (err) console.error('❌ 插入黑名单IP失败：', err.message);
             });
+        });
+
+        return res.status(200).json({ success: true, msg: '黑名单保存成功' });
+    });
+});
+
+// ========== 核心接口：重置访客数据 ==========
+app.delete('/api/reset-visitor', (req, res) => {
+    db.run(`DELETE FROM visitors`, (err) => {
+        if (err) {
+            console.error('❌ 清空访客记录失败：', err.message);
+            return res.status(200).json({ success: false, msg: '访客记录重置失败' });
+        }
+
+        db.run(`VACUUM`, (err) => {
+            if (err) console.error('❌ 数据库优化失败：', err.message);
+            res.status(200).json({ success: true, msg: '访客记录重置成功（数据库已优化）' });
         });
     });
 });
 
-// 8. 根路径验证接口（方便查看服务状态，避免Cannot GET /）
+// ========== 根路径验证 ==========
 app.get('/', (req, res) => {
     return res.status(200).json({
         success: true,
-        message: '访客统计服务（最稳定真实IP版）运行正常',
-        serviceTime: new Date().toLocaleString(),
+        message: '访客统计服务（完整后台版）运行正常',
         availableApis: [
-            { path: '/api/record-visitor', method: 'POST', desc: '记录访客真实IP（无需传参）' },
+            { path: '/api/record-visitor', method: 'POST', desc: '记录访客真实IP（过滤黑名单）' },
             { path: '/api/get-visitor-data', method: 'GET', desc: '获取访客统计数据' },
+            { path: '/api/delete-visitor/:id', method: 'DELETE', desc: '单个删除访客记录' },
+            { path: '/api/batch-delete-visitor', method: 'DELETE', desc: '批量删除访客记录' },
+            { path: '/api/edit-visitor/:id', method: 'PUT', desc: '编辑访客备注' },
+            { path: '/api/get-blacklist', method: 'GET', desc: '获取黑名单IP列表' },
+            { path: '/api/save-blacklist', method: 'POST', desc: '保存黑名单IP列表' },
             { path: '/api/reset-visitor', method: 'DELETE', desc: '重置所有访客记录' }
         ]
     });
 });
 
-// 9. 端口配置（兼容Render动态端口，本地默认3000）
+// ========== 端口配置 ==========
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`✅ 访客统计服务运行在端口 ${port}（最稳定真实IP版）`);
-    console.log(`✅ 服务访问地址：http://localhost:${port}`);
+    console.log(`✅ 访客统计服务运行在端口 ${port}（完整后台版）`);
 });
 
-// 10. 进程退出时关闭数据库连接（避免数据损坏）
+// ========== 进程退出时关闭数据库 ==========
 process.on('exit', () => {
     db.close((err) => {
-        if (err) {
-            console.error('❌ 数据库连接关闭失败：', err.message);
-            return;
-        }
-        console.log('✅ 数据库连接正常关闭');
+        if (err) console.error('❌ 数据库连接关闭失败：', err.message);
+        else console.log('✅ 数据库连接正常关闭');
     });
 });
