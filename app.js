@@ -30,7 +30,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
         console.error('❌ 数据库连接失败：', err.message);
         return;
     }
-    console.log('✅ 数据库连接成功（完整后台版）');
+    console.log('✅ 数据库连接成功（精准北京时间+黑名单拦截版）');
 
     // 创建访客表（新增备注字段）
     const createVisitorTableSql = `
@@ -63,9 +63,8 @@ const db = new sqlite3.Database(dbPath, (err) => {
     });
 });
 
-// ========== 核心接口：记录访客（过滤黑名单） ==========
-app.post('/api/record-visitor', (req, res) => {
-    // 1. 获取真实IP
+// ========== 工具函数：获取真实IP ==========
+function getRealIp(req) {
     let realIp = '';
     if (req.headers['x-forwarded-for']) {
         realIp = req.headers['x-forwarded-for'].split(',').map(ip => ip.trim())[0];
@@ -79,13 +78,73 @@ app.post('/api/record-visitor', (req, res) => {
         realIp = '未知公网IP（兼容模式）';
     }
 
-    // 2. 过滤本地IP
+    // 过滤本地IP
     const localIpReg = /^(127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|::1|localhost)/i;
     if (localIpReg.test(realIp)) {
         realIp = '服务器内网IP（非访客真实IP）';
     }
 
-    // 3. 检查黑名单
+    return realIp;
+}
+
+// ========== 工具函数：生成精准北京时间（UTC+8，无偏差） ==========
+function getBeijingTime() {
+    const offsetHours = 8; // 北京时间固定为 UTC+8
+    const now = new Date();
+    // 转换为北京时间
+    const beijingTime = new Date(now.getTime() + (offsetHours * 60 * 60 * 1000) - (now.getTimezoneOffset() * 60 * 1000));
+    // 格式化为 YYYY-MM-DD HH:mm:ss（数据库友好格式）
+    return beijingTime.toISOString().replace('T', ' ').slice(0, 19);
+}
+
+// ========== 核心接口：验证IP是否在黑名单（用于前端访问限制） ==========
+app.get('/api/verify-ip', (req, res) => {
+    const realIp = getRealIp(req);
+
+    // 过滤本地IP（默认允许访问）
+    const localIpReg = /^(127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|::1|localhost)/i;
+    if (localIpReg.test(realIp)) {
+        return res.status(200).json({
+            success: true,
+            allowAccess: true,
+            msg: '本地IP，允许访问'
+        });
+    }
+
+    // 检查黑名单
+    db.get(`SELECT * FROM blacklist WHERE ip = ?`, [realIp], (err, blacklistItem) => {
+        if (err) {
+            console.error('❌ 验证IP黑名单失败：', err.message);
+            return res.status(200).json({
+                success: false,
+                allowAccess: true, // 异常时默认允许访问
+                msg: 'IP验证异常'
+            });
+        }
+
+        if (blacklistItem) {
+            // IP在黑名单，禁止访问
+            return res.status(200).json({
+                success: true,
+                allowAccess: false,
+                msg: '该IP已被列入黑名单，禁止访问'
+            });
+        } else {
+            // IP合法，允许访问
+            return res.status(200).json({
+                success: true,
+                allowAccess: true,
+                msg: 'IP合法，允许访问'
+            });
+        }
+    });
+});
+
+// ========== 核心接口：记录访客（过滤黑名单+精准北京时间） ==========
+app.post('/api/record-visitor', (req, res) => {
+    const realIp = getRealIp(req);
+
+    // 检查黑名单
     db.get(`SELECT * FROM blacklist WHERE ip = ?`, [realIp], (err, blacklistItem) => {
         if (err) {
             console.error('❌ 检查黑名单失败：', err.message);
@@ -97,15 +156,12 @@ app.post('/api/record-visitor', (req, res) => {
             return res.status(200).json({ success: false, msg: '该IP已被限制访问' });
         }
 
-        // 4. 时区转换（UTC+8 北京时间）
-        const offsetHours = 8;
-        const localTime = new Date();
-        localTime.setHours(localTime.getUTCHours() + offsetHours);
-        const formattedTime = localTime.toISOString().replace('T', ' ').slice(0, 19);
+        // 生成精准北京时间（无需后续转换）
+        const beijingTime = getBeijingTime();
 
-        // 5. 写入数据库
+        // 写入数据库
         const insertSql = `INSERT INTO visitors (ip, visit_time) VALUES (?, ?)`;
-        db.run(insertSql, [realIp, formattedTime], (err) => {
+        db.run(insertSql, [realIp, beijingTime], (err) => {
             if (err) {
                 console.error('❌ 写入访客记录失败：', err.message);
                 return res.status(200).json({ success: false, msg: '访客记录失败' });
@@ -115,7 +171,7 @@ app.post('/api/record-visitor', (req, res) => {
                 success: true,
                 msg: '访客记录成功',
                 visitorIp: realIp,
-                visitTime: formattedTime
+                visitTime: beijingTime // 返回精准北京时间
             });
         });
     });
@@ -247,8 +303,9 @@ app.post('/api/save-blacklist', (req, res) => {
 
         const insertSql = `INSERT OR IGNORE INTO blacklist (ip, create_time) VALUES (?, CURRENT_TIMESTAMP)`;
         blacklist.forEach(ip => {
-            db.run(insertSql, [ip.trim()], (err) => {
-                if (err) console.error('❌ 插入黑名单IP失败：', err.message);
+            const trimIp = ip.trim();
+            db.run(insertSql, [trimIp], (err) => {
+                if (err) console.error(`❌ 插入黑名单IP [${trimIp}] 失败：`, err.message);
             });
         });
 
@@ -275,9 +332,11 @@ app.delete('/api/reset-visitor', (req, res) => {
 app.get('/', (req, res) => {
     return res.status(200).json({
         success: true,
-        message: '访客统计服务（完整后台版）运行正常',
+        message: '访客统计服务（精准北京时间+黑名单拦截版）运行正常',
+        currentBeijingTime: getBeijingTime(), // 显示当前精准北京时间
         availableApis: [
-            { path: '/api/record-visitor', method: 'POST', desc: '记录访客真实IP（过滤黑名单）' },
+            { path: '/api/verify-ip', method: 'GET', desc: '验证IP是否在黑名单（用于前端访问限制）' },
+            { path: '/api/record-visitor', method: 'POST', desc: '记录访客真实IP（过滤黑名单+精准北京时间）' },
             { path: '/api/get-visitor-data', method: 'GET', desc: '获取访客统计数据' },
             { path: '/api/delete-visitor/:id', method: 'DELETE', desc: '单个删除访客记录' },
             { path: '/api/batch-delete-visitor', method: 'DELETE', desc: '批量删除访客记录' },
@@ -292,7 +351,8 @@ app.get('/', (req, res) => {
 // ========== 端口配置 ==========
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`✅ 访客统计服务运行在端口 ${port}（完整后台版）`);
+    console.log(`✅ 访客统计服务运行在端口 ${port}（精准北京时间+黑名单拦截版）`);
+    console.log(`📌 当前精准北京时间：${getBeijingTime()}`);
 });
 
 // ========== 进程退出时关闭数据库 ==========
